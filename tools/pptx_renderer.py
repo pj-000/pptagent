@@ -1,6 +1,6 @@
 import os
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from models.schemas import PresentationPlan, SlideSpec, TextElement
@@ -24,16 +24,6 @@ ALIGN_MAP = {
 class PPTXRenderer:
 
     def render(self, plan: PresentationPlan, filename: str = "output.pptx") -> str:
-        """
-        渲染完整 PPT。
-
-        Args:
-            plan: 经过 Pydantic 校验的 PresentationPlan 对象
-            filename: 输出文件名（不含路径）
-
-        Returns:
-            输出文件的绝对路径
-        """
         prs = Presentation()
         prs.slide_width = Inches(plan.slide_width)
         prs.slide_height = Inches(plan.slide_height)
@@ -48,25 +38,23 @@ class PPTXRenderer:
         return os.path.abspath(output_path)
 
     def _render_slide(self, prs: Presentation, spec: SlideSpec, plan: PresentationPlan):
-        """渲染单页幻灯片"""
         blank_layout = prs.slide_layouts[6]
         slide = prs.slides.add_slide(blank_layout)
 
-        # 设置背景色
         fill = slide.background.fill
         fill.solid()
         fill.fore_color.rgb = hex_to_rgb(spec.background_color)
 
-        # 渲染每个文字元素
         for elem in spec.elements:
-            self._add_text_box(slide, elem, plan.font_family)
+            if elem.type == "image_placeholder":
+                self._add_image(slide, elem)
+            else:
+                self._add_text_box(slide, elem, plan.font_family)
 
-        # 添加演讲者备注
         if spec.speaker_notes:
             slide.notes_slide.notes_text_frame.text = spec.speaker_notes
 
     def _add_text_box(self, slide, elem: TextElement, font_family: str):
-        """在幻灯片上添加文本框"""
         txBox = slide.shapes.add_textbox(
             Inches(elem.x),
             Inches(elem.y),
@@ -92,3 +80,40 @@ class PPTXRenderer:
             font.size = Pt(elem.font_size)
             font.bold = elem.bold
             font.color.rgb = hex_to_rgb(elem.color)
+
+    def _add_image(self, slide, elem: TextElement):
+        """插入图片或灰色占位矩形。"""
+        left = Inches(elem.x)
+        top = Inches(elem.y)
+        width = Inches(elem.width)
+        height = Inches(elem.height)
+
+        if elem.local_image_path and os.path.isfile(elem.local_image_path):
+            try:
+                slide.shapes.add_picture(
+                    elem.local_image_path, left, top, width, height
+                )
+                return
+            except Exception as e:
+                print(f"[Renderer] 图片插入失败，使用占位: {e}")
+
+        # 灰色占位矩形
+        from pptx.util import Emu
+        shape = slide.shapes.add_shape(
+            1,  # MSO_SHAPE.RECTANGLE
+            left, top, width, height
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = RGBColor(0xE0, 0xE0, 0xE0)
+        shape.line.fill.background()
+
+        # 占位文字
+        tf = shape.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        run = p.add_run()
+        desc = elem.content or elem.unsplash_query or "图片"
+        run.text = f"[图片] {desc}"
+        run.font.size = Pt(12)
+        run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)

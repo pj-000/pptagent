@@ -29,7 +29,7 @@ def simple_plan():
                 topic="封面",
                 elements=[
                     TextElement(
-                        content="测试标题",
+                        content="测试标题", type="title",
                         x=1.0, y=2.5, width=11.333, height=1.5,
                         font_size=40, bold=True, color="#1F3864", align="center"
                     )
@@ -41,12 +41,12 @@ def simple_plan():
                 topic="正文",
                 elements=[
                     TextElement(
-                        content="正文标题",
+                        content="正文标题", type="title",
                         x=0.5, y=0.3, width=12.333, height=0.9,
                         font_size=32, bold=True, color="#1F3864", align="left"
                     ),
                     TextElement(
-                        content="• 要点一\n• 要点二\n• 要点三",
+                        content="• 要点一\n• 要点二\n• 要点三", type="body",
                         x=0.5, y=1.5, width=12.333, height=5.5,
                         font_size=18, color="#333333", align="left"
                     )
@@ -58,7 +58,7 @@ def simple_plan():
                 topic="结尾",
                 elements=[
                     TextElement(
-                        content="感谢聆听",
+                        content="感谢聆听", type="title",
                         x=1.0, y=2.5, width=11.333, height=1.2,
                         font_size=44, bold=True, color="#1F3864", align="center"
                     )
@@ -157,16 +157,16 @@ def test_multiline_text(renderer, tmp_path):
                 SlideSpec(
                     slide_index=0, layout=SlideLayout.CONTENT, topic="多行",
                     elements=[
-                        TextElement(content="标题", x=0.5, y=0.3, width=12.0, height=0.9,
+                        TextElement(content="标题", type="title", x=0.5, y=0.3, width=12.0, height=0.9,
                                     font_size=32, bold=True, color="#000000", align="left"),
-                        TextElement(content=multiline_content, x=0.5, y=1.5, width=12.0, height=5.5,
+                        TextElement(content=multiline_content, type="body", x=0.5, y=1.5, width=12.0, height=5.5,
                                     font_size=18, color="#333333", align="left"),
                     ]
                 ),
                 SlideSpec(
                     slide_index=1, layout=SlideLayout.CLOSING, topic="结尾",
                     elements=[
-                        TextElement(content="结束", x=1.0, y=2.5, width=11.0, height=1.2,
+                        TextElement(content="结束", type="title", x=1.0, y=2.5, width=11.0, height=1.2,
                                     font_size=40, bold=True, color="#000000", align="center")
                     ]
                 )
@@ -193,14 +193,14 @@ def test_speaker_notes(renderer, tmp_path):
                     slide_index=0, layout=SlideLayout.CONTENT, topic="有备注的页",
                     speaker_notes="这是演讲者备注",
                     elements=[
-                        TextElement(content="标题", x=0.5, y=0.3, width=12.0, height=0.9,
+                        TextElement(content="标题", type="title", x=0.5, y=0.3, width=12.0, height=0.9,
                                     font_size=32, bold=True, color="#000000", align="left"),
                     ]
                 ),
                 SlideSpec(
                     slide_index=1, layout=SlideLayout.CLOSING, topic="结尾",
                     elements=[
-                        TextElement(content="结束", x=1.0, y=2.5, width=11.0, height=1.2,
+                        TextElement(content="结束", type="title", x=1.0, y=2.5, width=11.0, height=1.2,
                                     font_size=40, bold=True, color="#000000", align="center")
                     ]
                 )

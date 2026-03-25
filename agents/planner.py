@@ -1,52 +1,107 @@
 import json
 import re
+import logging
 from pathlib import Path
 from openai import OpenAI
-from models.schemas import PresentationPlan, SlideLayout
-from tools.templates import apply_template
+from models.schemas import PresentationPlan, LayoutValidationError
 import config
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
 
 
 class PlannerAgent:
     """
-    调用 GLM API（OpenAI 兼容接口）生成 PPT 大纲和内容，
-    然后将内容与固定模板坐标合并，生成完整的 PresentationPlan。
+    调用 GLM API（OpenAI 兼容接口）生成完整的 PPT 布局规划 JSON，
+    包含每个元素的精确坐标和尺寸。
     """
 
     def __init__(self):
         self.client = OpenAI(api_key=config.GLM_API_KEY, base_url=config.GLM_BASE_URL)
-        self.system_prompt = Path("prompts/planner_system.txt").read_text(encoding="utf-8")
-        self.user_template = Path("prompts/planner_user.txt").read_text(encoding="utf-8")
+        self._system_template = Path("prompts/planner_system.txt").read_text(encoding="utf-8")
+        self._user_template = Path("prompts/planner_user.txt").read_text(encoding="utf-8")
 
-    def plan(self, topic: str) -> PresentationPlan:
+    def _build_system_prompt(self) -> str:
+        return self._system_template.format(
+            slide_width=config.SLIDE_WIDTH_INCH,
+            slide_height=config.SLIDE_HEIGHT_INCH,
+        )
+
+    def _build_user_prompt(self, topic: str, min_slides: int = 6, max_slides: int = 10) -> str:
+        return self._user_template.format(
+            topic=topic,
+            slide_width=config.SLIDE_WIDTH_INCH,
+            slide_height=config.SLIDE_HEIGHT_INCH,
+            language="中文",
+            min_slides=min_slides,
+            max_slides=max_slides,
+        )
+
+    def plan(self, topic: str, min_slides: int = 6, max_slides: int = 10) -> PresentationPlan:
         """
-        输入主题，输出完整的 PresentationPlan。
+        输入主题，输出完整的 PresentationPlan（含动态坐标）。
+        若 JSON 解析或校验失败，自动重试最多 MAX_RETRIES 次。
         """
         print(f"[Planner] 开始规划主题：{topic}")
 
-        user_message = self.user_template.format(topic=topic)
+        system_prompt = self._build_system_prompt()
+        user_prompt = self._build_user_prompt(topic, min_slides=min_slides, max_slides=max_slides)
+        errors_so_far: list[str] = []
+        last_raw = ""
 
-        response = self.client.chat.completions.create(
-            model=config.PLANNER_MODEL,
-            max_tokens=config.MAX_TOKENS_PLANNER,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_message}
+        for attempt in range(1, MAX_RETRIES + 1):
+            print(f"[Planner] 第 {attempt}/{MAX_RETRIES} 次尝试...")
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ]
+
+            # 如果之前有错误，注入到对话中让模型修正
+            if errors_so_far:
+                error_feedback = (
+                    "你上一次的输出有以下问题，请修正后重新输出完整 JSON：\n"
+                    + "\n".join(f"- {e}" for e in errors_so_far)
+                )
+                messages.append({"role": "user", "content": error_feedback})
+
+            response = self.client.chat.completions.create(
+                model=config.PLANNER_MODEL,
+                max_tokens=config.MAX_TOKENS_PLANNER,
+                messages=messages,
+            )
+
+            last_raw = response.choices[0].message.content
+            print(f"[Planner] API 调用完成，usage: {response.usage}")
+
+            # 尝试解析和校验
+            try:
+                plan_data = self._parse_json(last_raw)
+                plan = PresentationPlan.model_validate(plan_data)
+                print(f"[Planner] 规划完成，共 {len(plan.slides)} 页")
+                return plan
+            except (ValueError, json.JSONDecodeError) as e:
+                err_msg = f"JSON 解析失败: {e}"
+                logger.warning(f"[Planner] 第 {attempt} 次尝试失败: {err_msg}")
+                print(f"[Planner] 第 {attempt} 次尝试失败: {err_msg}")
+                errors_so_far = [err_msg]
+            except Exception as e:
+                err_msg = f"校验失败: {e}"
+                logger.warning(f"[Planner] 第 {attempt} 次尝试失败: {err_msg}")
+                print(f"[Planner] 第 {attempt} 次尝试失败: {err_msg}")
+                errors_so_far = [err_msg]
+
+        # 所有重试都失败
+        raise LayoutValidationError(
+            errors=errors_so_far,
+            raw_json=last_raw,
         )
-
-        raw_response = response.choices[0].message.content
-        print(f"[Planner] API 调用完成，usage: {response.usage}")
-
-        plan_data = self._parse_json(raw_response)
-        presentation_plan = self._build_plan(plan_data)
-        print(f"[Planner] 规划完成，共 {len(presentation_plan.slides)} 页")
-        return presentation_plan
 
     def _parse_json(self, raw: str) -> dict:
         """
         解析 LLM 返回的 JSON。
-        LLM 有时会在 JSON 外面包一层 ```json ... ```，需要去掉。
+        兼容 ```json ... ``` 包裹格式。
         """
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
         cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -59,36 +114,3 @@ class PlannerAgent:
                 f"错误：{e}\n"
                 f"原始内容（前 500 字）：{raw[:500]}"
             )
-
-    def _build_plan(self, data: dict) -> PresentationPlan:
-        """
-        将 LLM 输出的 JSON 数据 + 固定模板坐标合并，
-        构建完整的 PresentationPlan（含每个元素的 x/y/w/h）。
-        """
-        slides = []
-        for slide_data in data.get("slides", []):
-            layout_str = slide_data.get("layout", "content")
-
-            try:
-                layout = SlideLayout(layout_str)
-            except ValueError:
-                print(f"[Planner] 警告：未知布局类型 '{layout_str}'，使用 content 代替")
-                layout = SlideLayout.CONTENT
-
-            content = slide_data.get("content", {})
-            slide_index = slide_data.get("slide_index", len(slides))
-
-            slide_spec = apply_template(layout, content, slide_index)
-
-            if "notes" in slide_data:
-                slide_spec.speaker_notes = slide_data["notes"]
-
-            slides.append(slide_spec)
-
-        return PresentationPlan(
-            title=data.get("title", "未命名演示"),
-            topic=data.get("topic", ""),
-            theme_color=data.get("theme_color", "#1F3864"),
-            accent_color=data.get("accent_color", "#2E75B6"),
-            slides=slides
-        )
