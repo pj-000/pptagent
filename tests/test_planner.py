@@ -5,105 +5,157 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from unittest.mock import MagicMock, patch
-from agents.planner import PlannerAgent
-from models.schemas import PresentationPlan, SlideLayout, LayoutValidationError
+from agents.planner import PlannerAgent, normalize_audience, suggest_audience_label
+from models.schemas import OutlinePlan
 
 
 @pytest.fixture
 def mock_planner():
     """返回一个 mock 掉 API 和文件读取的 PlannerAgent"""
-    with patch("agents.planner.OpenAI") as mock_openai:
-        with patch("agents.planner.Path") as mock_path:
-            mock_path.return_value.read_text.return_value = "mock prompt"
-            planner = PlannerAgent()
-            planner.client = MagicMock()
-            planner._system_template = "s {slide_width} {slide_height}"
-            planner._user_template = "u {topic} {slide_width} {slide_height} {language} {min_slides} {max_slides}"
-            yield planner
-
-
-# ─── 代码提取测试 ───
+    with patch("agents.planner.OpenAI"):
+        with patch("agents.planner.assert_skill_present"):
+            with patch("agents.planner.Path") as mock_path:
+                mock_path.return_value.read_text.return_value = "mock prompt"
+                planner = PlannerAgent()
+                planner.client = MagicMock()
+                planner._skill_md = "## Design Ideas\n- test"
+                planner._pptxgenjs_md = "# PptxGenJS Tutorial\n- test"
+                planner._user_template = (
+                    "topic={topic} lang={language} style={style} style_ref={style_reference} "
+                    "audience={audience} audience_ref={audience_reference} "
+                    "profile={audience_profile} outline={outline_context} "
+                    "research={research_context} "
+                    "min={min_slides} max={max_slides}"
+                )
+                yield planner
 
 
 def test_extract_code_tag(mock_planner):
-    """从 <code>...</code> 提取代码"""
-    raw = "Here is the code:\n<code>\ndef generate_slides(output_dir):\n    return 0\n</code>\nDone."
+    raw = "Here is the code:\n<code>\nconst pptxgen = require('pptxgenjs');\n</code>\nDone."
     code = mock_planner._extract_code(raw)
-    assert "def generate_slides" in code
+    assert "pptxgenjs" in code
 
 
-def test_extract_python_block(mock_planner):
-    """从 ```python...``` 提取代码"""
-    raw = "```python\ndef generate_slides(output_dir):\n    return 0\n```"
+def test_extract_javascript_block(mock_planner):
+    raw = "```javascript\nconst pptxgen = require('pptxgenjs');\n```"
     code = mock_planner._extract_code(raw)
-    assert "def generate_slides" in code
+    assert "pptxgenjs" in code
 
 
 def test_extract_generic_block(mock_planner):
-    """从 ```...``` 提取代码"""
-    raw = "```\ndef generate_slides(output_dir):\n    return 0\n```"
+    raw = "```\nconst pptxgen = require('pptxgenjs');\n```"
     code = mock_planner._extract_code(raw)
-    assert "def generate_slides" in code
+    assert "pptxgenjs" in code
 
 
 def test_no_code_raises(mock_planner):
-    """无代码块应报错"""
     with pytest.raises(ValueError, match="未找到"):
         mock_planner._extract_code("这里没有代码")
 
 
-# ─── 代码执行测试 ───
+def test_inject_output_path_existing_writefile(mock_planner):
+    code = 'pres.writeFile({ fileName: "old.pptx" });'
+    new_code = mock_planner._inject_output_path(code, "/tmp/new.pptx")
+    assert 'fileName: "/tmp/new.pptx"' in new_code
+    assert "old.pptx" not in new_code
 
 
-def test_execute_valid_code(mock_planner, tmp_path):
-    """合法代码执行后生成 XML 文件"""
-    xml_dir = str(tmp_path)
-    code = '''
-def generate_slides(output_dir):
-    import os, xml.etree.ElementTree as ET
-    os.makedirs(output_dir, exist_ok=True)
-    s = ET.Element("slide", index="0", layout="cover", topic="封面", background_color="#1E2761")
-    t = ET.SubElement(s, "element", type="title", x="1.5", y="2.0", width="10.333", height="1.8",
-                      font_size="44", bold="true", color="#FFFFFF", align="center")
-    t.text = "测试"
-    ET.ElementTree(s).write(os.path.join(output_dir, "slide_0.xml"), encoding="unicode", xml_declaration=True)
-    s1 = ET.Element("slide", index="1", layout="closing", topic="结尾", background_color="#1E2761")
-    t1 = ET.SubElement(s1, "element", type="title", x="1.5", y="2.5", width="10.333", height="1.5",
-                       font_size="44", bold="true", color="#FFFFFF", align="center")
-    t1.text = "结束"
-    ET.ElementTree(s1).write(os.path.join(output_dir, "slide_1.xml"), encoding="unicode", xml_declaration=True)
-    p = ET.Element("presentation", title="测试", topic="测试", theme_color="#1E2761",
-                   accent_color="#CADCFC", font_family="Microsoft YaHei", slide_count="2")
-    ET.ElementTree(p).write(os.path.join(output_dir, "presentation.xml"), encoding="unicode", xml_declaration=True)
-    return 2
-'''
-    mock_planner._execute_code(code, xml_dir)
-    assert os.path.isfile(os.path.join(xml_dir, "slide_0.xml"))
-    assert os.path.isfile(os.path.join(xml_dir, "presentation.xml"))
+def test_inject_output_path_append_writefile(mock_planner):
+    code = 'const pptxgen = require("pptxgenjs");\nlet pres = new pptxgen();'
+    new_code = mock_planner._inject_output_path(code, "/tmp/new.pptx")
+    assert 'pres.writeFile({ fileName: "/tmp/new.pptx" });' in new_code
 
 
-def test_execute_bad_code_raises(mock_planner, tmp_path):
-    """语法错误的代码应抛出 RuntimeError"""
-    code = "def generate_slides(output_dir):\n    raise ValueError('故意失败')"
-    with pytest.raises(RuntimeError, match="代码执行失败"):
-        mock_planner._execute_code(code, str(tmp_path))
+def test_build_user_prompt_includes_style(mock_planner):
+    prompt = mock_planner._build_user_prompt(
+        "测试主题",
+        6,
+        8,
+        language="English",
+        style="minimal",
+        audience="投资人",
+        outline_context="第0页 cover",
+        research_context="主题摘要：行业增长快\n- 要点A",
+    )
+    assert "style=minimal" in prompt
+    assert "style_ref=minimal" in prompt
+    assert "topic=测试主题" in prompt
+    assert "lang=English" in prompt
+    assert "audience=投资人" in prompt
+    assert "audience_ref=investor" in prompt
+    assert "市场空间" in prompt
+    assert "outline=第0页 cover" in prompt
+    assert "research=主题摘要：行业增长快\n- 要点A" in prompt
 
 
-# ─── 集成测试（需要真实 API） ───
+def test_extract_json_handles_code_fence(mock_planner):
+    data = mock_planner._extract_json('```json\n{"title":"测试"}\n```')
+    assert data["title"] == "测试"
+
+
+def test_sanitize_generated_code_fixes_shape_aliases(mock_planner):
+    code = (
+        'slide.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 1, h: 1 });\n'
+        'slide.addShape("RECTANGLE", { x: 1, y: 1, w: 1, h: 1 });'
+    )
+    sanitized = mock_planner._sanitize_generated_code(code)
+    assert 'addShape("rect"' in sanitized
+
+
+def test_parse_outline_plan_validates_structure(mock_planner):
+    outline = mock_planner._parse_outline_plan(
+        {
+            "title": "人工智能",
+            "topic": "人工智能",
+            "slides": [
+                {"slide_index": 0, "layout": "cover", "topic": "人工智能概览", "objective": "开场"},
+                {"slide_index": 1, "layout": "toc", "topic": "目录", "objective": "建立结构"},
+                {"slide_index": 2, "layout": "content", "topic": "核心技术", "objective": "解释技术"},
+                {"slide_index": 3, "layout": "closing", "topic": "总结", "objective": "收尾"},
+            ],
+        },
+        "人工智能",
+    )
+    assert isinstance(outline, OutlinePlan)
+    assert outline.slides[2].topic == "核心技术"
+
+
+def test_outline_to_research_slides(mock_planner):
+    outline = OutlinePlan.model_validate(
+        {
+            "title": "人工智能",
+            "topic": "人工智能",
+            "slides": [
+                {"slide_index": 0, "layout": "cover", "topic": "封面"},
+                {"slide_index": 1, "layout": "toc", "topic": "目录"},
+                {"slide_index": 2, "layout": "content", "topic": "应用场景"},
+                {"slide_index": 3, "layout": "closing", "topic": "结束"},
+            ],
+        }
+    )
+    slides = mock_planner.outline_to_research_slides(outline)
+    assert len(slides) == 4
+    assert slides[2].topic == "应用场景"
+    assert slides[2].elements[0].type == "title"
+
+
+def test_normalize_audience_aliases():
+    assert normalize_audience("大学生") == "大学生"
+    assert suggest_audience_label("大学生") == "student"
+    assert suggest_audience_label("老板") == "boss"
+    assert suggest_audience_label("投资人") == "investor"
+    assert suggest_audience_label("unknown-audience") is None
 
 
 def test_plan_with_real_api():
-    """集成测试：调用真实 GLM API"""
     if not os.getenv("GLM_API_KEY"):
         pytest.skip("未设置 GLM_API_KEY，跳过真实 API 测试")
 
     planner = PlannerAgent()
-    plan = planner.plan("量子计算入门")
+    output_path = planner.plan("量子计算入门")
 
-    assert isinstance(plan, PresentationPlan)
-    assert len(plan.slides) >= 2
-    assert plan.slides[0].layout == SlideLayout.COVER
+    assert isinstance(output_path, str)
+    assert output_path.endswith(".pptx")
+    assert os.path.exists(output_path)
 
-    print(f"\n生成 {len(plan.slides)} 页幻灯片")
-    for s in plan.slides:
-        print(f"  第 {s.slide_index} 页：{s.layout.value} - {s.topic}")
+    print(f"\n生成文件: {output_path}")

@@ -141,6 +141,14 @@ class SlideSpec(BaseModel):
         return self
 
 
+class SlideOutline(BaseModel):
+    """单页大纲：用于规划与研究，不包含最终渲染元素。"""
+    slide_index: int
+    layout: SlideLayout
+    topic: str
+    objective: str = ""
+
+
 def _generate_short_id() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -160,6 +168,23 @@ class PresentationPlan(BaseModel):
     @field_validator("slides")
     @classmethod
     def validate_slide_count(cls, v: List[SlideSpec]) -> List[SlideSpec]:
+        if len(v) < 2:
+            raise ValueError("PPT 至少需要 2 页")
+        if len(v) > 20:
+            raise ValueError("PPT 最多 20 页")
+        return v
+
+
+class OutlinePlan(BaseModel):
+    """PPT 页级大纲，用于 Planner 与 Research 之间的中间态。"""
+    title: str
+    topic: str
+    slides: List[SlideOutline] = []
+    job_id: str = Field(default_factory=_generate_short_id)
+
+    @field_validator("slides")
+    @classmethod
+    def validate_slide_count(cls, v: List[SlideOutline]) -> List[SlideOutline]:
         if len(v) < 2:
             raise ValueError("PPT 至少需要 2 页")
         if len(v) > 20:

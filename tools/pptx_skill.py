@@ -36,7 +36,7 @@ def skill_paths() -> dict:
         "root": str(SKILL_ROOT),
         "skill_md": str(SKILL_ROOT / "SKILL.md"),
         "pptxgenjs_md": str(SKILL_ROOT / "pptxgenjs.md"),
-        "editing_md": str(SKILL_ROOT / "editing.md"),
+        "local_rules_md": str(SKILL_ROOT / "local_rules.md"),
         "thumbnail_py": str(SCRIPTS_ROOT / "thumbnail.py"),
         "soffice_py": str(OFFICE_ROOT / "soffice.py"),
         "unpack_py": str(OFFICE_ROOT / "unpack.py"),

@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from openai import AsyncOpenAI
 from tavily import AsyncTavilyClient
-from models.schemas import SlideSpec, SlideLayout
+from models.schemas import SlideSpec, SlideLayout, TextElement
 import config
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,39 @@ class ResearchAgent:
     def __init__(self):
         self.tavily = AsyncTavilyClient(api_key=config.TAVILY_API_KEY)
         self.llm = AsyncOpenAI(api_key=config.GLM_API_KEY, base_url=config.GLM_BASE_URL)
+        self.client = self.llm
         self._system_template = Path("prompts/researcher_system.txt").read_text(encoding="utf-8")
+
+    async def research_topic(self, topic: str, language: str = "中文") -> dict:
+        """
+        对整份 PPT 主题做一次前置研究，供 Planner 生成时参考。
+        当前主流程还没有“先产出 slides 再逐页 research”的中间态，
+        所以这里用一个 synthetic content slide 复用现有 research_slide 逻辑。
+        """
+        slide = SlideSpec(
+            slide_index=0,
+            layout=SlideLayout.CONTENT,
+            topic=topic,
+            elements=[
+                TextElement(
+                    type="title",
+                    content=topic,
+                    x=0.5,
+                    y=0.3,
+                    width=12.0,
+                    height=0.9,
+                    font_size=32,
+                    bold=True,
+                    color="#1F3864",
+                )
+            ],
+        )
+        result = await self.research_slide(slide, language=language)
+        return result or {
+            "topic": topic,
+            "summary": topic,
+            "bullet_points": [],
+        }
 
     async def research_slide(self, slide: SlideSpec, language: str = "中文") -> dict | None:
         """
@@ -48,7 +80,7 @@ class ResearchAgent:
                 f"请根据以上资料，为该 PPT 页面生成精炼的内容。"
             )
 
-            response = await self.llm.chat.completions.create(
+            response = await self.client.chat.completions.create(
                 model=config.RESEARCH_MODEL,
                 max_tokens=config.MAX_TOKENS_RESEARCHER,
                 messages=[
