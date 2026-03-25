@@ -6,7 +6,7 @@ load_dotenv()
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_BASE_URL = os.getenv("GLM_BASE_URL", "")
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "glm-5")
-MAX_TOKENS_PLANNER = 4096
+MAX_TOKENS_PLANNER = 16384
 
 # Research Agent (Tavily)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")

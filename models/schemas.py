@@ -6,11 +6,11 @@ from enum import Enum
 # 幻灯片边界常量
 SLIDE_WIDTH = 13.333
 SLIDE_HEIGHT = 7.5
-BOUNDARY_TOLERANCE = 0.01  # 允许 0.01 英寸浮点误差
+BOUNDARY_TOLERANCE = 0.01
 
 
 class LayoutValidationError(Exception):
-    """布局校验失败异常，携带详细错误列表和原始 JSON"""
+    """布局校验失败异常，携带详细错误列表和原始内容"""
 
     def __init__(self, errors: List[str], raw_json: str = ""):
         self.errors = errors
@@ -27,8 +27,15 @@ class SlideLayout(str, Enum):
     CLOSING = "closing"
 
 
+# Phase 4 支持的元素类型
+ELEMENT_TYPES = {
+    "title", "subtitle", "body", "image_placeholder",
+    "shape", "callout",
+}
+
+
 class TextElement(BaseModel):
-    """单个元素，包含内容和位置信息。支持文本和图片占位。"""
+    """单个元素：文本、形状、图片占位、callout。"""
     content: str = ""
     x: float
     y: float
@@ -40,16 +47,28 @@ class TextElement(BaseModel):
     align: Literal["left", "center", "right"] = "left"
     type: str = "body"
 
-    # Phase 3: 图片相关字段
+    # Phase 3: 图片
     unsplash_query: Optional[str] = None
     dalle_prompt: Optional[str] = None
     local_image_path: Optional[str] = None
+
+    # Phase 4: 形状
+    shape_type: Optional[str] = None       # rect / circle / line
+    fill_color: Optional[str] = None       # 形状填充色
+    corner_radius: Optional[float] = None  # 圆角半径（英寸），仅 rect
 
     @field_validator("color")
     @classmethod
     def validate_color(cls, v: str) -> str:
         if not v.startswith("#") or len(v) != 7:
             raise ValueError(f"颜色必须是 7 位十六进制格式，如 #1F3864，收到：{v}")
+        return v
+
+    @field_validator("fill_color")
+    @classmethod
+    def validate_fill_color(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and (not v.startswith("#") or len(v) != 7):
+            raise ValueError(f"fill_color 格式错误：{v}")
         return v
 
     @field_validator("x", "y")
@@ -67,8 +86,7 @@ class TextElement(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_boundary_and_image(self):
-        """校验边界 + image_placeholder 必须提供 query 或 prompt"""
+    def validate_boundary_and_constraints(self):
         right_edge = self.x + self.width
         bottom_edge = self.y + self.height
         if right_edge > SLIDE_WIDTH + BOUNDARY_TOLERANCE:
@@ -86,6 +104,11 @@ class TextElement(BaseModel):
                 raise ValueError(
                     "image_placeholder 元素必须至少提供 unsplash_query 或 dalle_prompt 之一"
                 )
+        if self.type == "shape":
+            if not self.shape_type:
+                raise ValueError("shape 元素必须指定 shape_type（rect / circle / line）")
+            if not self.fill_color:
+                raise ValueError("shape 元素必须指定 fill_color")
         return self
 
 
@@ -107,9 +130,11 @@ class SlideSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_has_title(self):
-        """每页至少有一个 type='title' 的元素"""
+        """每页至少有一个 type='title' 的元素（纯形状页除外）"""
+        text_types = {"title", "subtitle", "body", "callout"}
+        has_text = any(elem.type in text_types for elem in self.elements)
         has_title = any(elem.type == "title" for elem in self.elements)
-        if not has_title and len(self.elements) > 0:
+        if has_text and not has_title and len(self.elements) > 0:
             raise ValueError(
                 f"第 {self.slide_index} 页缺少 type='title' 的元素"
             )
@@ -121,7 +146,7 @@ def _generate_short_id() -> str:
 
 
 class PresentationPlan(BaseModel):
-    """完整 PPT 规划，从 Planner 输出，交给 Renderer 渲染"""
+    """完整 PPT 规划"""
     title: str
     topic: str
     slide_width: float = 13.333
