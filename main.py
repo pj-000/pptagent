@@ -51,6 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
     research_group.add_argument("--research", dest="research", action="store_true", help="启用联网 Research（Tavily）")
     research_group.add_argument("--no-research", dest="research", action="store_false", help="跳过联网 Research（Tavily）")
     parser.set_defaults(research=None)
+    images_group = parser.add_mutually_exclusive_group()
+    images_group.add_argument("--images", dest="images", action="store_true", help="启用图片获取")
+    images_group.add_argument("--no-images", dest="images", action="store_false", help="跳过图片获取")
+    parser.set_defaults(images=None)
+    parser.add_argument(
+        "--image-source",
+        choices=["auto", "search", "generate"],
+        default=None,
+        help="图片来源：auto=搜图优先降级生成，search=仅Tavily搜图，generate=仅豆包生成",
+    )
     return parser
 
 
@@ -101,12 +111,30 @@ def main():
     else:
         research_enabled = args.research
 
+    if args.images is None:
+        images_enabled = ask_yes_no("启用图片获取", default=True)
+    else:
+        images_enabled = args.images
+
+    image_source = "auto"
+    if images_enabled:
+        if args.image_source:
+            image_source = args.image_source
+        else:
+            raw = ask(
+                "图片来源（auto=搜图优先/search=仅搜索/generate=仅豆包生成）",
+                default="auto"
+            ).strip().lower()
+            image_source = raw if raw in ("auto", "search", "generate") else "auto"
+
     filename = f"{slugify(topic)}.pptx"
 
     try:
         orchestrator = OrchestratorAgent(
             debug_layout=args.debug_layout,
             no_research=not research_enabled,
+            no_images=not images_enabled,
+            image_source=image_source,
         )
         output_path = orchestrator.generate(
             topic=topic,

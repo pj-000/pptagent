@@ -25,7 +25,15 @@ ASSETS_DIR = "assets"
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 UNSPLASH_BASE_URL = "https://api.unsplash.com"
 
-# DALL-E (通过 OpenAI 兼容接口)
-DALLE_MODEL = os.getenv("DALLE_MODEL", "dall-e-3")
-DALLE_IMAGE_SIZE = os.getenv("DALLE_IMAGE_SIZE", "1024x1024")
-DALLE_IMAGE_QUALITY = os.getenv("DALLE_IMAGE_QUALITY", "standard")
+# 豆包图片生成
+ARK_API_KEY = os.getenv("ARK_API_KEY", "")
+ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DOUBAO_IMAGE_MODEL = os.getenv("DOUBAO_IMAGE_MODEL", "doubao-seedream-4-5-251128")
+DOUBAO_IMAGE_SIZE = os.getenv("DOUBAO_IMAGE_SIZE", "2K")
+
+# Qwen-VL 视觉评估
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "")
+QWEN_VL_MODEL = os.getenv("QWEN_VL_MODEL", "qwen-vl-max")
+EVAL_SCORE_THRESHOLD = float(os.getenv("EVAL_SCORE_THRESHOLD", "3.0"))
+EVAL_MAX_ROUNDS = int(os.getenv("EVAL_MAX_ROUNDS", "2"))

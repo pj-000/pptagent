@@ -147,6 +147,7 @@ class SlideOutline(BaseModel):
     layout: SlideLayout
     topic: str
     objective: str = ""
+    image_prompt: Optional[str] = None
 
 
 def _generate_short_id() -> str:
@@ -190,3 +191,14 @@ class OutlinePlan(BaseModel):
         if len(v) > 20:
             raise ValueError("PPT 最多 20 页")
         return v
+
+
+class SlideEvalResult(BaseModel):
+    """单页视觉评分结果。"""
+    slide_index: int
+    layout_score: float   # 布局合理性 1-5
+    content_score: float  # 内容完整性 1-5
+    design_score: float   # 视觉质量 1-5
+    overall: float        # 加权平均
+    issues: List[str] = []
+    suggestions: List[str] = []

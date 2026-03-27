@@ -1,136 +1,179 @@
-import os
-import hashlib
+"""
+agents/asset_agent.py
+
+为 PPT 每页获取配图，支持三种模式：
+- image_source="search"   : 仅 Tavily 搜图，搜不到则跳过
+- image_source="generate" : 仅豆包生成，不搜索
+- image_source="auto"     : Tavily 搜图，搜不到降级豆包生成（默认）
+"""
 import asyncio
+import hashlib
 import logging
+from pathlib import Path
+from typing import Optional
+
 import httpx
-from models.schemas import SlideSpec, TextElement
+from openai import AsyncOpenAI
+from tavily import AsyncTavilyClient
+
 import config
+from models.schemas import SlideLayout, SlideOutline
 
 logger = logging.getLogger(__name__)
 
+SKIP_LAYOUTS = {SlideLayout.COVER, SlideLayout.CLOSING, SlideLayout.TOC}
+
 
 class AssetAgent:
-    """为 image_placeholder 元素获取真实图片。优先 Unsplash，降级 DALL-E。"""
+    """
+    并发为大纲每页搜索或生成配图，返回本地路径列表。
+    列表长度与 slides 一致，无图片的页为 None。
+    """
 
-    def __init__(self):
-        self.unsplash_key = config.UNSPLASH_ACCESS_KEY
-        self.glm_api_key = config.GLM_API_KEY
-        self.glm_base_url = config.GLM_BASE_URL
+    def __init__(self, image_source: str = "auto"):
+        """
+        image_source:
+          "auto"     — Tavily 搜图，搜不到降级豆包生成
+          "search"   — 仅 Tavily 搜图
+          "generate" — 仅豆包生成
+        """
+        self.image_source = image_source
+        if image_source in ("auto", "search"):
+            self.tavily = AsyncTavilyClient(api_key=config.TAVILY_API_KEY)
+        else:
+            self.tavily = None
+        if image_source in ("auto", "generate"):
+            self.ark = AsyncOpenAI(
+                api_key=config.ARK_API_KEY,
+                base_url=config.ARK_BASE_URL,
+            )
+        else:
+            self.ark = None
 
     async def fetch_all(
-        self, slides: list[SlideSpec], job_id: str, concurrency: int = 3
-    ) -> list[SlideSpec]:
-        """
-        扫描所有 image_placeholder 元素，下载图片并回写 local_image_path。
-        返回修改后的 slides（原地修改）。
-        """
-        cache_dir = os.path.join(config.ASSETS_DIR, job_id)
-        os.makedirs(cache_dir, exist_ok=True)
+        self,
+        slides: list[SlideOutline],
+        job_id: str,
+        concurrency: int = 3,
+    ) -> list[Optional[str]]:
+        asset_dir = Path(config.ASSETS_DIR) / job_id
+        asset_dir.mkdir(parents=True, exist_ok=True)
 
         sem = asyncio.Semaphore(concurrency)
-        tasks = []
 
-        for slide in slides:
-            for elem in slide.elements:
-                if elem.type == "image_placeholder":
-                    tasks.append(self._fetch_one(elem, cache_dir, sem))
+        async def _bounded(slide: SlideOutline) -> Optional[str]:
+            async with sem:
+                return await self._fetch_for_slide(slide, asset_dir)
 
-        if tasks:
-            await asyncio.gather(*tasks)
+        results = await asyncio.gather(*[_bounded(s) for s in slides], return_exceptions=True)
 
-        return slides
+        processed = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.warning(f"[AssetAgent] 第 {i} 页图片获取异常: {r}")
+                processed.append(None)
+            else:
+                processed.append(r)
 
-    async def _fetch_one(self, elem: TextElement, cache_dir: str, sem: asyncio.Semaphore):
-        """获取单张图片，失败时 local_image_path 保持 None。"""
-        async with sem:
-            # 生成缓存 key
-            cache_key = self._cache_key(elem.unsplash_query, elem.dalle_prompt)
-            cached_path = os.path.join(cache_dir, f"{cache_key}.jpg")
+        fetched = sum(1 for p in processed if p)
+        print(f"[AssetAgent] 完成，{fetched}/{len(slides)} 页获取到图片（模式: {self.image_source}）")
+        return processed
 
-            # 1. 缓存命中
-            if os.path.exists(cached_path) and os.path.getsize(cached_path) > 0:
-                elem.local_image_path = cached_path
-                print(f"[Asset] 缓存命中: {cached_path}")
-                return
+    async def _fetch_for_slide(self, slide: SlideOutline, asset_dir: Path) -> Optional[str]:
+        if slide.layout in SKIP_LAYOUTS:
+            return None
 
-            # 2. Unsplash
-            if elem.unsplash_query and self.unsplash_key:
-                path = await self._fetch_unsplash(elem.unsplash_query, cached_path)
-                if path:
-                    elem.local_image_path = path
-                    return
+        query = slide.image_prompt.strip() if slide.image_prompt else f"{slide.topic} photo"
+        cache_key = hashlib.md5(f"{self.image_source}:{query}".encode()).hexdigest()[:10]
 
-            # 3. DALL-E 降级
-            if elem.dalle_prompt and self.glm_api_key:
-                path = await self._fetch_dalle(elem.dalle_prompt, cached_path)
-                if path:
-                    elem.local_image_path = path
-                    return
+        for ext in (".jpg", ".png"):
+            cached = asset_dir / f"{cache_key}{ext}"
+            if cached.exists() and cached.stat().st_size > 0:
+                print(f"[AssetAgent] 第 {slide.slide_index} 页命中缓存")
+                return str(cached)
 
-            # 两者都失败
-            logger.warning(f"[Asset] 图片获取失败: query={elem.unsplash_query}")
-            print(f"[Asset] 图片获取失败: {elem.unsplash_query or elem.dalle_prompt}")
+        if self.image_source == "generate":
+            return await self._try_generate(slide, asset_dir, cache_key)
 
-    async def _fetch_unsplash(self, query: str, save_path: str) -> str | None:
-        """从 Unsplash 搜索并下载第一张图片。"""
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{config.UNSPLASH_BASE_URL}/search/photos",
-                    params={"query": query, "per_page": 1, "orientation": "landscape"},
-                    headers={"Authorization": f"Client-ID {self.unsplash_key}"},
-                )
-                if resp.status_code != 200:
-                    logger.warning(f"[Asset] Unsplash API 返回 {resp.status_code}")
-                    return None
+        if self.image_source == "search":
+            return await self._try_search(slide, asset_dir, cache_key, query)
 
-                data = resp.json()
-                results = data.get("results", [])
-                if not results:
-                    logger.info(f"[Asset] Unsplash 无结果: {query}")
-                    return None
+        # auto: 先搜，搜不到再生成
+        result = await self._try_search(slide, asset_dir, cache_key, query)
+        if result:
+            return result
+        return await self._try_generate(slide, asset_dir, cache_key)
 
-                image_url = results[0]["urls"]["regular"]
-                img_resp = await client.get(image_url, timeout=30)
-                if img_resp.status_code == 200:
-                    with open(save_path, "wb") as f:
-                        f.write(img_resp.content)
-                    print(f"[Asset] Unsplash 下载成功: {query} -> {save_path}")
-                    return save_path
-        except Exception as e:
-            logger.warning(f"[Asset] Unsplash 失败: {e}")
+    async def _try_search(self, slide, asset_dir, cache_key, query) -> Optional[str]:
+        image_url = await self._search_image(query)
+        if image_url:
+            local_path = asset_dir / f"{cache_key}.jpg"
+            if await self._download(image_url, local_path):
+                print(f"[AssetAgent] 第 {slide.slide_index} 页 Tavily 搜图成功")
+                return str(local_path)
         return None
 
-    async def _fetch_dalle(self, prompt: str, save_path: str) -> str | None:
-        """通过 OpenAI 兼容接口调用图片生成。"""
-        try:
-            from openai import AsyncOpenAI
+    async def _try_generate(self, slide, asset_dir, cache_key) -> Optional[str]:
+        if not self.ark or not config.ARK_API_KEY:
+            print(f"[AssetAgent] 第 {slide.slide_index} 页：ARK_API_KEY 未配置，跳过生成")
+            return None
+        local_path = asset_dir / f"{cache_key}_gen.png"
+        prompt = self._make_image_prompt(slide.topic, slide.image_prompt)
+        if await self._generate_doubao(prompt, local_path):
+            print(f"[AssetAgent] 第 {slide.slide_index} 页豆包生成成功")
+            return str(local_path)
+        return None
 
-            client = AsyncOpenAI(api_key=self.glm_api_key, base_url=self.glm_base_url)
-            response = await client.images.generate(
-                model=config.DALLE_MODEL,
-                prompt=prompt,
-                size=config.DALLE_IMAGE_SIZE,
-                quality=config.DALLE_IMAGE_QUALITY,
-                n=1,
+    async def _search_image(self, query: str) -> Optional[str]:
+        try:
+            result = await self.tavily.search(
+                query=query,
+                max_results=5,
+                search_depth="basic",
+                include_images=True,
             )
-            image_url = response.data[0].url
-            if not image_url:
-                return None
-
-            async with httpx.AsyncClient(timeout=30) as http_client:
-                img_resp = await http_client.get(image_url)
-                if img_resp.status_code == 200:
-                    with open(save_path, "wb") as f:
-                        f.write(img_resp.content)
-                    print(f"[Asset] DALL-E 生成成功: {prompt[:40]}... -> {save_path}")
-                    return save_path
+            images = result.get("images", [])
+            for img in images:
+                url = img if isinstance(img, str) else img.get("url", "")
+                if url and any(url.lower().split("?")[0].endswith(ext)
+                               for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    return url
+            if images:
+                return images[0] if isinstance(images[0], str) else images[0].get("url")
         except Exception as e:
-            logger.warning(f"[Asset] DALL-E 失败: {e}")
+            logger.warning(f"[AssetAgent] Tavily 搜图失败: {e}")
         return None
+
+    async def _generate_doubao(self, prompt: str, output_path: Path) -> bool:
+        try:
+            response = await self.ark.images.generate(
+                model=config.DOUBAO_IMAGE_MODEL,
+                prompt=prompt,
+                size=config.DOUBAO_IMAGE_SIZE,
+                response_format="url",
+            )
+            url = response.data[0].url
+            return await self._download(url, output_path)
+        except Exception as e:
+            logger.warning(f"[AssetAgent] 豆包生成失败: {e}")
+            return False
+
+    async def _download(self, url: str, output_path: Path) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                r = await client.get(url)
+                if r.status_code == 200:
+                    output_path.write_bytes(r.content)
+                    return True
+                logger.warning(f"[AssetAgent] 下载失败 HTTP {r.status_code}: {url[:80]}")
+        except Exception as e:
+            logger.warning(f"[AssetAgent] 下载异常: {e}")
+        return False
 
     @staticmethod
-    def _cache_key(query: str | None, prompt: str | None) -> str:
-        """基于 query/prompt 生成稳定的缓存文件名。"""
-        raw = f"{query or ''}|{prompt or ''}"
-        return hashlib.md5(raw.encode()).hexdigest()[:12]
+    def _make_image_prompt(topic: str, image_prompt: Optional[str] = None) -> str:
+        base = image_prompt.strip() if image_prompt else topic
+        return (
+            f"{base}，专业演示文稿配图风格，"
+            "简洁构图，高对比度，无文字水印，16:9 横向构图，商务专业感，光线明亮"
+        )

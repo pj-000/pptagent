@@ -73,7 +73,7 @@ class ResearchAgent:
             context = "\n\n".join(snippets[:3])
 
             # Step 2: GLM 提炼为 PPT 要点
-            system_prompt = self._system_template.format(language=language)
+            system_prompt = self._system_template.replace("{language}", language)
             user_prompt = (
                 f"页面主题：{slide.topic}\n\n"
                 f"以下是搜索到的参考资料：\n{context[:2000]}\n\n"
@@ -89,6 +89,7 @@ class ResearchAgent:
                 ],
             )
             raw = response.choices[0].message.content
+            print(f"[Research] 第 {slide.slide_index} 页 LLM 原始响应前200字：{repr(raw[:200])}")
             data = self._parse_json(raw)
 
             if "bullet_points" not in data or not isinstance(data["bullet_points"], list):
@@ -120,6 +121,34 @@ class ResearchAgent:
         return list(results)
 
     def _parse_json(self, raw: str) -> dict:
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        cleaned = raw.strip()
+        # 去掉 ```json ... ``` 围栏
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-        return json.loads(cleaned)
+        cleaned = cleaned.strip()
+
+        # 尝试直接解析
+        try:
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # fallback：提取第一个 {...} 块
+        match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned, re.DOTALL)
+        if match:
+            result = json.loads(match.group(0))
+            if isinstance(result, dict):
+                return result
+
+        # 最后尝试：找最外层的 { 到最后一个 }
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            candidate = cleaned[first_brace:last_brace + 1]
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                return result
+
+        raise ValueError(f"无法从响应中提取 JSON dict，原始内容前200字：{cleaned[:200]}")

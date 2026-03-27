@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from openai import OpenAI
 from tools.pptx_skill import run_js, skill_paths, assert_skill_present
-from models.schemas import OutlinePlan, SlideOutline, SlideLayout
+from models.schemas import OutlinePlan, SlideOutline, SlideLayout, SlideEvalResult
 import config
 
 logger = logging.getLogger(__name__)
@@ -211,7 +211,8 @@ class PlannerAgent:
       "slide_index": 0,
       "layout": "cover",
       "topic": "本页主题",
-      "objective": "本页想传达的目标"
+      "objective": "本页想传达的目标",
+      "image_prompt": ""
     }
   ]
 }
@@ -224,6 +225,7 @@ class PlannerAgent:
 5. `topic` 要具体到适合单页研究和展开
 6. `objective` 用一句话说明本页任务
 7. 幻灯片总页数必须落在用户要求范围内
+8. `image_prompt`：content/two_column 页必须填写一句英文视觉描述（15-40词），描述具体画面主体、场景、氛围，适合图片搜索或 AI 生图；cover/toc/closing 页留空字符串 ""
 """
 
     def _build_outline_user_prompt(
@@ -255,7 +257,7 @@ class PlannerAgent:
     def _build_user_prompt(self, topic: str, min_slides: int = 6, max_slides: int = 10,
                            style: str = "auto", audience: str = "general",
                            language: str = "中文", research_context: str = "",
-                           outline_context: str = "") -> str:
+                           outline_context: str = "", image_context: str = "") -> str:
         audience = normalize_audience(audience)
         style = (style or "").strip() or "auto"
         audience_profile = self._build_audience_profile(audience)
@@ -271,6 +273,7 @@ class PlannerAgent:
                 .replace("{audience_reference}", suggest_audience_label(audience) or "无")
                 .replace("{outline_context}", outline_context.strip() or "无显式页级大纲，请自行规划结构。")
                 .replace("{research_context}", research_context.strip() or "无额外研究资料，请基于常识与准确性完成。")
+                .replace("{image_context}", image_context.strip() or "无可用图片。")
                 .replace("{min_slides}", str(min_slides))
                 .replace("{max_slides}", str(max_slides)))
 
@@ -319,84 +322,397 @@ class PlannerAgent:
 
         raise RuntimeError(f"页级大纲规划失败，最后响应前500字：{last_raw[:500]}")
 
+    # ------------------------------------------------------------------ #
+    #  逐页生成                                                             #
+    # ------------------------------------------------------------------ #
+
+    def decide_visual_theme(
+        self,
+        outline: OutlinePlan,
+        style: str = "auto",
+        audience: str = "general",
+        language: str = "中文",
+    ) -> dict:
+        """
+        一次 LLM 调用，确定整份 PPT 的视觉母题。
+        返回 dict，包含 primary_color / secondary_color / accent_color /
+        header_font / body_font / motif_description / pres_init_code。
+        """
+        style = (style or "").strip() or "auto"
+        system = (
+            "你是 PPT 视觉设计师。根据主题和风格，输出整份 PPT 的视觉母题 JSON。\n"
+            "只输出 JSON，不要解释。格式：\n"
+            "{\n"
+            '  "primary_color": "1E2761",\n'
+            '  "secondary_color": "CADCFC",\n'
+            '  "accent_color": "FFFFFF",\n'
+            '  "header_font": "Georgia",\n'
+            '  "body_font": "Calibri",\n'
+            '  "motif_description": "左侧深色色带 + 圆形图标 + 卡片内容区",\n'
+            '  "pres_init_code": "pres.layout = \\"LAYOUT_WIDE\\";"\n'
+            "}\n\n"
+            "颜色不要带 # 号。primary_color 明度要低（深色），accent_color 要高对比。"
+        )
+        slide_topics = "\n".join(
+            f"- 第{s.slide_index}页 [{s.layout.value}] {s.topic}"
+            for s in outline.slides
+        )
+        user = (
+            f"主题：{outline.title}\n"
+            f"风格：{style}\n"
+            f"受众：{audience}\n"
+            f"语言：{language}\n\n"
+            f"页面列表：\n{slide_topics}\n\n"
+            "请选择与主题高度匹配的配色和视觉母题，不要默认蓝色。"
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model=config.PLANNER_MODEL,
+                max_tokens=512,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+            data = self._extract_json(resp.choices[0].message.content)
+            if isinstance(data, dict) and "primary_color" in data:
+                print(f"[Planner] 视觉母题：{data.get('motif_description', '')}")
+                return data
+        except Exception as e:
+            logger.warning(f"[Planner] decide_visual_theme 失败，使用默认: {e}")
+        return {
+            "primary_color": "1F3864",
+            "secondary_color": "2E75B6",
+            "accent_color": "FFFFFF",
+            "header_font": "Arial Black",
+            "body_font": "Calibri",
+            "motif_description": "深色封面 + 浅色内容页 + 左侧色带装饰",
+            "pres_init_code": 'pres.layout = "LAYOUT_WIDE";',
+        }
+
+    def plan_slide(
+        self,
+        slide: SlideOutline,
+        theme: dict,
+        research: dict | None,
+        image_path: str | None,
+        prev_slides_summary: str = "",
+        revision_feedback: SlideEvalResult | None = None,
+    ) -> str:
+        """
+        为单页生成 PptxGenJS 代码片段（不含 require / pres 初始化 / writeFile）。
+        返回形如 `{ let slide = pres.addSlide(); ... }` 的代码块字符串。
+        """
+        SKIP = {SlideLayout.COVER, SlideLayout.TOC, SlideLayout.CLOSING}
+
+        system = self._build_slide_system_prompt()
+
+        # 构建本页 user prompt
+        parts = [
+            f"## 整份 PPT 视觉母题",
+            f"- 主色：#{theme.get('primary_color', '1F3864')}",
+            f"- 辅色：#{theme.get('secondary_color', '2E75B6')}",
+            f"- 点缀色：#{theme.get('accent_color', 'FFFFFF')}",
+            f"- 标题字体：{theme.get('header_font', 'Arial Black')}",
+            f"- 正文字体：{theme.get('body_font', 'Calibri')}",
+            f"- 视觉母题：{theme.get('motif_description', '')}",
+            "",
+            f"## 本页信息",
+            f"- 页码：第 {slide.slide_index} 页",
+            f"- 布局类型：{slide.layout.value}",
+            f"- 页面主题：{slide.topic}",
+            f"- 页面目标：{slide.objective}",
+        ]
+
+        if slide.image_prompt:
+            parts.append(f"- 图片描述：{slide.image_prompt}")
+
+        if research and slide.layout not in SKIP:
+            summary = research.get("summary", "")
+            bullets = research.get("bullet_points", [])
+            key_data = research.get("key_data", [])
+            if summary:
+                parts.append(f"\n## 研究摘要\n{summary}")
+            if bullets:
+                parts.append("\n## 要点（必须完整呈现）")
+                for b in bullets:
+                    parts.append(f"- {b}")
+            if key_data:
+                parts.append("\n## 核心数据（用 stat-callout 大字展示）")
+                for d in key_data:
+                    parts.append(f"- {d}")
+
+        if image_path:
+            parts.append(f"\n## 图片资产\n本页有图片，必须用 addImage({{ path: \"{image_path}\" }}) 插入，优先双栏布局（左文右图）。")
+
+        if prev_slides_summary:
+            parts.append(f"\n## 已生成页布局摘要（避免重复）\n{prev_slides_summary}")
+
+        if revision_feedback:
+            parts.append(f"\n## 上一版问题（必须修复）")
+            for issue in revision_feedback.issues:
+                parts.append(f"- 问题：{issue}")
+            for sug in revision_feedback.suggestions:
+                parts.append(f"- 建议：{sug}")
+
+        parts.append(
+            "\n## 输出要求\n"
+            "只输出本页的代码片段，用 <code> 标签包裹。\n"
+            "代码以 `{` 开头，以 `}` 结尾，内部第一行是 `let slide = pres.addSlide();`。\n"
+            "不要包含 require、new pptxgen()、pres.layout、writeFile。\n"
+            "严格遵守视觉母题的配色和字体，保持与其他页一致。\n\n"
+            "## 画布尺寸（必须遵守）\n"
+            "画布为 LAYOUT_WIDE：13.33\" × 7.5\"（英寸）。\n"
+            "- 背景色块/形状必须覆盖整个画布（x:0, y:0, w:13.33, h:7.5）\n"
+            "- 内容区域使用 0.5\" 外边距（x 从 0.5 开始，最大宽度 12.33\"）\n"
+            "- 不要把所有元素挤在画布中间一小块区域\n"
+            "- 封面/结尾页的标题和装饰必须铺满全屏，不能只占中间一小块"
+        )
+
+        user = "\n".join(parts)
+
+        last_raw = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=config.PLANNER_MODEL,
+                    max_tokens=4096,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                last_raw = resp.choices[0].message.content
+                code = self._extract_code(last_raw)
+                code = code.strip()
+                if not code.startswith("{"):
+                    code = "{\n" + code + "\n}"
+                print(f"[Planner] 第 {slide.slide_index} 页生成成功（{len(code)} 字符）")
+                return code
+            except Exception as e:
+                err_msg = str(e)
+                print(f"[Planner] 第 {slide.slide_index} 页第 {attempt} 次失败: {err_msg[:150]}")
+                logger.warning(f"[Planner] 第{slide.slide_index}页第{attempt}次失败: {e}")
+
+        raise RuntimeError(f"第{slide.slide_index}页生成失败，最后响应：{last_raw[:300]}")
+
+    def plan_all_slides(
+        self,
+        outline: OutlinePlan,
+        research_results: list[dict | None] | None,
+        image_paths: list[str | None] | None,
+        style: str = "auto",
+        audience: str = "general",
+        language: str = "中文",
+    ) -> tuple[list[str], dict]:
+        """
+        逐页生成代码片段。
+        返回 (slide_codes, theme)，slide_codes 与 outline.slides 一一对应。
+        """
+        research_results = research_results or [None] * len(outline.slides)
+        image_paths = image_paths or [None] * len(outline.slides)
+
+        print("[Planner] 确定视觉母题...")
+        theme = self.decide_visual_theme(outline, style=style, audience=audience, language=language)
+
+        slide_codes: list[str] = []
+        prev_summary_lines: list[str] = []
+
+        for i, slide in enumerate(outline.slides):
+            print(f"[Planner] 生成第 {slide.slide_index} 页（{slide.layout.value}: {slide.topic}）...")
+            research = research_results[i] if i < len(research_results) else None
+            img = image_paths[i] if i < len(image_paths) else None
+            prev_summary = "\n".join(prev_summary_lines[-5:])  # 最近5页
+
+            code = self.plan_slide(slide, theme, research, img, prev_summary)
+            slide_codes.append(code)
+            prev_summary_lines.append(f"第{slide.slide_index}页 [{slide.layout.value}] {slide.topic}")
+
+        print(f"[Planner] 逐页生成完成，共 {len(slide_codes)} 页")
+        return slide_codes, theme
+
+    def assemble_pptx(
+        self,
+        slide_codes: list[str],
+        output_path: str,
+        theme: dict,
+    ) -> str:
+        """
+        把所有页代码片段组装成完整 JS，执行生成 .pptx。
+        """
+        output_path = os.path.abspath(output_path)
+        safe_path = output_path.replace("\\", "/")
+
+        header_font = theme.get("header_font", "Arial Black")
+        body_font = theme.get("body_font", "Calibri")
+
+        lines = [
+            'const pptxgen = require("pptxgenjs");',
+            "let pres = new pptxgen();",
+            'pres.layout = "LAYOUT_WIDE";',
+            f'pres.title = "Presentation";',
+            f'// 视觉母题：{theme.get("motif_description", "")}',
+            f'// 主色：#{theme.get("primary_color", "")}  辅色：#{theme.get("secondary_color", "")}  点缀：#{theme.get("accent_color", "")}',
+            f'// 字体：{header_font} / {body_font}',
+            "",
+        ]
+
+        for i, code in enumerate(slide_codes):
+            lines.append(f"// ===== 第 {i} 页 =====")
+            lines.append(code)
+            lines.append("")
+
+        lines.append(f'pres.writeFile({{ fileName: "{safe_path}" }});')
+
+        full_code = "\n".join(lines)
+        full_code = self._sanitize_generated_code(full_code)
+
+        total_chars = sum(len(c) for c in slide_codes)
+        print(f"[Planner] 组装完成（{len(slide_codes)} 页，{total_chars} 字符），执行生成 PPTX...")
+        run_js(full_code, output_path)
+        print(f"[Planner] PPTX 生成成功: {output_path}")
+        return output_path
+
+    def _build_slide_system_prompt(self) -> str:
+        """单页生成的 system prompt：设计规范 + API 教程，要求只输出片段。"""
+        skill = self._skill_md
+        start_idx = skill.find("### Before Starting")
+        end_idx = skill.find("## QA")
+        if start_idx >= 0 and end_idx > start_idx:
+            design_section = skill[start_idx:end_idx].strip()
+        elif start_idx >= 0:
+            design_section = skill[start_idx:].strip()
+        else:
+            idx = skill.find("## Design Ideas")
+            design_section = skill[idx:].strip() if idx >= 0 else skill
+
+        return f"""你是一位顶级 PPT 视觉设计工程师，使用 PptxGenJS（Node.js）生成单页幻灯片代码片段。
+
+以下是来自 Anthropic 官方 PPTX Design Skill 的设计规范，你必须严格遵守：
+
+---
+{design_section}
+---
+
+以下是本地增强的生成规则（硬约束 + 视觉设计原则 + 布局词汇表），你也必须严格遵守：
+
+---
+{self._local_rules_md}
+---
+
+以下是 PptxGenJS 的完整 API 教程，你生成的代码必须严格遵循这些用法和注意事项：
+
+---
+{self._pptxgenjs_md}
+---
+
+## 你的输出格式
+
+输出单页代码片段，用 <code> 标签包裹。要求：
+1. 代码以 `{{` 开头，以 `}}` 结尾
+2. 内部第一行必须是 `let slide = pres.addSlide();`
+3. 不要包含 `require`、`new pptxgen()`、`pres.layout`、`writeFile`
+4. 严格遵守用户提供的视觉母题配色和字体
+5. 严格遵循上面所有设计规则和 PptxGenJS API 用法
+"""
+
     def plan(self, topic: str, output_path: str = None,
              min_slides: int = 6, max_slides: int = 10,
              style: str = "auto", audience: str = "general",
              language: str = "中文", research_context: str = "",
              outline: OutlinePlan | None = None,
-             research_results: list[dict | None] | None = None) -> str:
+             research_results: list[dict | None] | None = None,
+             image_paths: list[str | None] | None = None) -> tuple[str, list[str], dict]:
         """
-        生成 PptxGenJS 代码并执行，直接产出 .pptx 文件。
+        逐页生成 PptxGenJS 代码并执行，直接产出 .pptx 文件。
 
         Returns:
-            生成的 .pptx 文件绝对路径
+            (output_path, slide_codes, theme)
         """
         if output_path is None:
             os.makedirs(config.OUTPUT_DIR, exist_ok=True)
             output_path = os.path.join(config.OUTPUT_DIR, "output.pptx")
 
         output_path = os.path.abspath(output_path)
-        print(f"[Planner] 开始规划主题：{topic}")
 
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(
-            topic,
-            min_slides,
-            max_slides,
+        if outline is None:
+            raise ValueError("plan() 需要传入 outline，请先调用 plan_outline()")
+
+        slide_codes, theme = self.plan_all_slides(
+            outline,
+            research_results=research_results,
+            image_paths=image_paths,
             style=style,
             audience=audience,
             language=language,
-            outline_context=self._build_outline_context(outline),
-            research_context=research_context or self._build_research_context(outline, research_results),
         )
-        errors_so_far: list[str] = []
-        last_raw = ""
+        result_path = self.assemble_pptx(slide_codes, output_path, theme)
+        return result_path, slide_codes, theme
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            print(f"[Planner] 第 {attempt}/{MAX_RETRIES} 次尝试...")
+    def enrich_image_prompts(
+        self,
+        outline: OutlinePlan,
+        research_results: list[dict | None],
+    ) -> OutlinePlan:
+        """
+        用 research 结果重新生成每页的 image_prompt。
+        单次批量 LLM 调用，返回更新后的 OutlinePlan。
+        cover/toc/closing 页保持空。
+        """
+        SKIP = {SlideLayout.COVER, SlideLayout.TOC, SlideLayout.CLOSING}
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
+        # 构造输入：只包含需要生成 image_prompt 的页
+        items = []
+        for slide, result in zip(outline.slides, research_results or []):
+            if slide.layout in SKIP:
+                continue
+            summary = (result or {}).get("summary", "")
+            bullets = (result or {}).get("bullet_points", [])
+            items.append({
+                "slide_index": slide.slide_index,
+                "topic": slide.topic,
+                "summary": summary,
+                "bullets": bullets[:3],  # 只取前3条，控制 token
+            })
 
-            if errors_so_far:
-                error_feedback = (
-                    "你上一次输出的代码执行失败，请修正后重新输出完整的 <code>...</code>：\n"
-                    + "\n".join(f"- {e}" for e in errors_so_far)
-                )
-                messages.append({"role": "user", "content": error_feedback})
+        if not items:
+            return outline
 
+        print(f"[Planner] 基于 research 重写 image_prompt（{len(items)} 页）...")
+        system = (
+            "你是图片描述专家。根据每页的研究摘要，为每页输出一句15-40词的英文图片搜索描述，"
+            "描述具体画面主体、场景、氛围，适合图片搜索或 AI 生图。\n"
+            "只输出 JSON 数组，格式：[{\"slide_index\": 0, \"image_prompt\": \"...\"}]"
+        )
+        user = "以下是各页研究内容，请为每页生成 image_prompt：\n" + json.dumps(items, ensure_ascii=False)
+
+        try:
             response = self.client.chat.completions.create(
                 model=config.PLANNER_MODEL,
-                max_tokens=config.MAX_TOKENS_PLANNER,
-                messages=messages,
+                max_tokens=1024,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
             )
+            raw = response.choices[0].message.content
+            enriched = self._extract_json(raw)
+            if not isinstance(enriched, list):
+                raise ValueError("期望 JSON 数组")
 
-            last_raw = response.choices[0].message.content
-            print(f"[Planner] API 调用完成，usage: {response.usage}")
+            prompt_map = {item["slide_index"]: item.get("image_prompt", "") for item in enriched}
 
-            try:
-                code = self._extract_code(last_raw)
-                print(f"[Planner] 提取到代码（{len(code)} 字符）")
+            updated_slides = []
+            for slide in outline.slides:
+                if slide.slide_index in prompt_map and prompt_map[slide.slide_index]:
+                    updated_slides.append(slide.model_copy(update={"image_prompt": prompt_map[slide.slide_index]}))
+                else:
+                    updated_slides.append(slide)
 
-                sanitized_code = self._sanitize_generated_code(code)
-                full_code = self._inject_output_path(sanitized_code, output_path)
-                run_js(full_code, output_path)
-                print(f"[Planner] 生成完成: {output_path}")
-                return output_path
+            print(f"[Planner] image_prompt 已基于 research 更新，覆盖 {len(prompt_map)} 页")
+            return outline.model_copy(update={"slides": updated_slides})
 
-            except Exception as e:
-                err_msg = str(e)
-                errors_so_far = self._build_error_feedback(err_msg)
-                logger.warning(f"[Planner] 第 {attempt} 次失败: {err_msg[:200]}")
-                print(f"[Planner] 第 {attempt} 次失败: {err_msg[:200]}")
-
-        raise RuntimeError(
-            f"连续 {MAX_RETRIES} 次生成失败。\n"
-            f"最后错误: {errors_so_far}\n"
-            f"最后响应（前500字）: {last_raw[:500]}"
-        )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"[Planner] enrich_image_prompts 失败，保留原始 image_prompt: {e}")
+            return outline
 
     def outline_to_research_slides(self, outline: OutlinePlan) -> list:
         return [
@@ -438,16 +754,42 @@ class PlannerAgent:
         if not outline or not research_results:
             return ""
 
-        lines = ["以下是逐页 ResearchAgent 结果，请吸收为对应页面的事实依据和表达素材："]
+        lines = ["以下是逐页 ResearchAgent 结果，请充分吸收为对应页面的事实依据和表达素材："]
         for slide, result in zip(outline.slides, research_results):
             if not result:
                 continue
             summary = result.get("summary") or slide.topic
             bullet_points = result.get("bullet_points") or []
+            key_data = result.get("key_data") or []
             lines.append(f"- 第 {slide.slide_index} 页 {slide.topic}")
             lines.append(f"  - 摘要：{summary}")
             for point in bullet_points:
                 lines.append(f"  - 要点：{point}")
+            for kd in key_data:
+                lines.append(f"  - 核心数据（适合大字展示）：{kd}")
+        return "\n".join(lines)
+
+    def _build_image_context(
+        self,
+        outline: OutlinePlan | None,
+        image_paths: list[str | None] | None,
+    ) -> str:
+        if not outline or not image_paths:
+            return ""
+
+        lines = [
+            "以下是 AssetAgent 为每页准备的本地图片路径，生成代码时用 addImage({ path: '...' }) 插入：",
+            "图片建议位置：x=7.0, y=1.2, w=5.8, h=5.6（英寸），适合双栏右侧。",
+            "如果某页布局不适合双栏，可自行调整坐标，但必须使用提供的图片路径。",
+        ]
+        has_image = False
+        for slide, path in zip(outline.slides, image_paths):
+            if path:
+                lines.append(f"- 第 {slide.slide_index} 页（{slide.topic}）：{path}")
+                has_image = True
+
+        if not has_image:
+            return ""
         return "\n".join(lines)
 
     def _parse_outline_plan(self, data: dict, topic: str) -> OutlinePlan:
@@ -465,6 +807,7 @@ class PlannerAgent:
                     "layout": slide.get("layout", "content"),
                     "topic": slide.get("topic") or f"{topic} - 第{idx + 1}页",
                     "objective": slide.get("objective", ""),
+                    "image_prompt": slide.get("image_prompt") or None,
                 }
             )
 
@@ -580,6 +923,14 @@ class PlannerAgent:
             replace_addshape_string,
             code,
         )
+
+        # 替换中文引号为转义的 ASCII 引号，避免 JS 语法错误
+        # 例如: "正式命名"深度学习"" → "正式命名\"深度学习\""
+        code = code.replace("\u201c", '\\"')  # "
+        code = code.replace("\u201d", '\\"')  # "
+        code = code.replace("\u2018", "\\'")  # '
+        code = code.replace("\u2019", "\\'")  # '
+
         return code
 
     def _inject_output_path(self, code: str, output_path: str) -> str:
