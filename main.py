@@ -39,7 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--style",
         type=str,
-        help=f"PPT 风格，可填自由描述；常见示例：{'/'.join(SUPPORTED_STYLES)}",
+        help=(
+            "PPT 风格偏好，可留空让模型自动决定；"
+            f"常见示例：{'/'.join(s for s in SUPPORTED_STYLES if s != 'auto')}"
+        ),
     )
     parser.add_argument("--debug-layout", action="store_true", help="打印内容调试信息")
     parser.add_argument(
@@ -95,9 +98,9 @@ def main():
     slides_raw = args.slides or ask("PPT 页数（如 8，或范围如 6-10）", default="6-10")
     min_slides, max_slides = parse_slide_range(slides_raw)
 
-    style = args.style or ask(
-        "PPT 风格（auto/executive/ocean/minimal/coral/terracotta/teal/forest/berry/cherry）",
-        default="auto"
+    style = args.style if args.style is not None else ask(
+        "PPT 风格（可留空自动决定，也可输入偏好，如 executive/ocean/minimal）",
+        default=""
     )
 
     audience_raw = args.audience or ask(

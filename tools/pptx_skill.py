@@ -10,6 +10,8 @@ tools/pptx_skill.py
 4. skill_paths() — 返回本地 skill 路径，便于 planner 读取本地文档
 """
 import os
+import re
+import sys
 import subprocess
 import tempfile
 import logging
@@ -60,6 +62,110 @@ def assert_skill_present():
         )
 
 
+def _repair_common_js_syntax_errors(code: str, stderr: str) -> str:
+    """
+    修复 LLM 生成代码里常见的字符串闭合错误。
+
+    优先根据 Node 报错里标出的 caret 位置，定点转义出错位置左侧最近的裸引号；
+    如果拿不到位置信息，再回退到少量窄范围正则修复。
+    """
+    if "SyntaxError" not in stderr:
+        return code
+
+    repaired = _repair_quote_near_syntax_error(code, stderr)
+    if repaired != code:
+        return repaired
+
+    repaired = code
+    patterns = [
+        # 例如：text: "内容\", options: ...
+        (r'\\(["\'])\s*,\s*([A-Za-z_$][\w$]*\s*:)', r'\1, \2'),
+        # 例如：const x = "内容\");
+        (r'\\(["\'])\s*([}\]\),;])', r'\1\2'),
+    ]
+
+    for pattern, replacement in patterns:
+        repaired = re.sub(pattern, replacement, repaired)
+
+    return repaired
+
+
+def _repair_quote_near_syntax_error(code: str, stderr: str) -> str:
+    """根据 Node SyntaxError 的 caret 位置，修复该位置左侧最近的裸引号。"""
+    location = _extract_syntax_error_location(stderr)
+    if not location:
+        return code
+
+    line_no, caret_col = location
+    lines = code.splitlines(keepends=True)
+    if line_no < 1 or line_no > len(lines):
+        return code
+
+    line = lines[line_no - 1]
+    line_body = line.rstrip("\r\n")
+    if not line_body:
+        return code
+
+    search_start = min(max(caret_col - 1, 0), len(line_body) - 1)
+    for i in range(search_start, -1, -1):
+        ch = line_body[i]
+        if ch not in ('"', "'"):
+            continue
+        if i > 0 and line_body[i - 1] == "\\":
+            continue
+
+        replacement = "\\u0022" if ch == '"' else "\\u0027"
+        suffix = line[len(line_body):]
+        lines[line_no - 1] = line_body[:i] + replacement + line_body[i + 1:] + suffix
+        return "".join(lines)
+
+    return code
+
+
+def _extract_syntax_error_location(stderr: str) -> tuple[int, int] | None:
+    """
+    从 Node SyntaxError 输出中提取 (line_no, caret_col)。
+    caret_col 为 0-based 列号。
+    """
+    match = re.search(r":(\d+)\n[^\n]*\n([ \t]*)\^", stderr)
+    if not match:
+        return None
+    return int(match.group(1)), len(match.group(2))
+
+
+def _cleanup_preview_images(output_dir: str) -> None:
+    """清理旧的 slide 预览图，避免多轮 QA 混入历史图片。"""
+    if not os.path.isdir(output_dir):
+        return
+
+    for name in os.listdir(output_dir):
+        lowered = name.lower()
+        if name.startswith("slide") and lowered.endswith((".jpg", ".jpeg", ".png")):
+            try:
+                os.unlink(os.path.join(output_dir, name))
+            except FileNotFoundError:
+                pass
+
+
+def _slide_image_sort_key(path: str) -> tuple[int, str]:
+    """按页码数字排序 slide-1.jpg / slide-01.jpg / slide-10.jpg。"""
+    name = os.path.basename(path)
+    match = re.search(r"(\d+)(?=\.[^.]+$)", name)
+    if not match:
+        return (10**9, name)
+    return (int(match.group(1)), name)
+
+
+def _collect_slide_images(output_dir: str) -> list[str]:
+    """收集并按页码排序当前目录里的 slide 预览图。"""
+    images = [
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if f.startswith("slide") and f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ]
+    return sorted(images, key=_slide_image_sort_key)
+
+
 def run_js(code: str, output_path: str, timeout: int = 60) -> str:
     """
     执行一段 PptxGenJS JavaScript 代码，生成 .pptx 文件。
@@ -78,11 +184,36 @@ def run_js(code: str, output_path: str, timeout: int = 60) -> str:
         env = os.environ.copy()
         env["NODE_PATH"] = NODE_PATH
 
-        result = subprocess.run(
-            ["node", tmp_js],
-            capture_output=True, text=True,
-            timeout=timeout, env=env,
-        )
+        code_to_run = code
+        last_result = None
+
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                Path(tmp_js).write_text(code_to_run, encoding="utf-8")
+
+            result = subprocess.run(
+                ["node", tmp_js],
+                capture_output=True, text=True,
+                timeout=timeout, env=env,
+            )
+            last_result = result
+
+            if result.returncode == 0:
+                break
+
+            repaired = _repair_common_js_syntax_errors(code_to_run, result.stderr)
+            if repaired == code_to_run:
+                break
+
+            logger.warning(
+                "[PptxSkill] 检测到可修复的 JS SyntaxError，自动修复后重试（第 %s/%s 次）",
+                attempt + 2,
+                max_attempts,
+            )
+            code_to_run = repaired
+
+        result = last_result
 
         if result.returncode != 0:
             raise RuntimeError(
@@ -118,47 +249,146 @@ def read_pptx(path: str) -> str:
         return ""
 
 
+def _find_binary(name: str) -> str | None:
+    """在常见路径中查找可执行文件，解决 conda 环境 PATH 不含 /opt/homebrew/bin 的问题。"""
+    import shutil
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]:
+        candidate = os.path.join(d, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _find_libreoffice_app_soffice() -> str | None:
+    """在 macOS 上优先定位 LibreOffice.app 内部真实的 soffice 可执行文件。"""
+    candidates = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/Applications/OpenOffice.app/Contents/MacOS/soffice",
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _build_soffice_convert_commands(pptx_path: str, output_dir: str) -> list[list[str]]:
+    """构造一组可依次尝试的 soffice 转 PDF 命令。"""
+    profile_dir = tempfile.mkdtemp(prefix="pptagent_lo_profile_")
+    convert_args = [
+        f"-env:UserInstallation=file://{profile_dir}",
+        "--headless",
+        "--nologo",
+        "--nodefault",
+        "--nofirststartwizard",
+        "--nolockcheck",
+        "--convert-to",
+        "pdf:impress_pdf_Export",
+        "--outdir",
+        output_dir,
+        pptx_path,
+    ]
+
+    commands: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add(command: list[str]) -> None:
+        key = tuple(command)
+        if key not in seen:
+            seen.add(key)
+            commands.append(command)
+
+    soffice_bin = _find_binary("soffice")
+
+    if sys.platform == "darwin":
+        app_soffice = _find_libreoffice_app_soffice()
+        if app_soffice:
+            add(["open", "-g", "-W", "-n", "-a", "LibreOffice", "--args", *convert_args])
+            add([app_soffice, *convert_args])
+
+    if soffice_bin:
+        add([soffice_bin, *convert_args])
+
+    return commands
+
+
 def pptx_to_images(pptx_path: str, output_dir: str = None) -> list[str]:
     """
-    调用本地 vendored skill 的 soffice.py 将 .pptx 转 PDF，再用 pdftoppm 转图片。
+    用 soffice 将 .pptx 转 PDF，再用 pdftoppm 转图片。
+    macOS 上优先通过 `open -a LibreOffice --args ...` 启动应用，
+    避免直接从后台 CLI 拉起 `soffice` 时在 AppKit 初始化阶段崩溃。
     """
-    assert_skill_present()
+    pdftoppm_bin = _find_binary("pdftoppm")
+    soffice_commands = _build_soffice_convert_commands(pptx_path, output_dir or os.path.join(os.path.dirname(pptx_path), "slides_preview"))
+    if not soffice_commands:
+        logger.warning("[PptxSkill] 未找到 soffice，跳过图片转换")
+        return []
+    if not pdftoppm_bin:
+        logger.warning("[PptxSkill] 未找到 pdftoppm，跳过图片转换")
+        return []
 
     if output_dir is None:
         output_dir = os.path.join(os.path.dirname(pptx_path), "slides_preview")
     os.makedirs(output_dir, exist_ok=True)
+    _cleanup_preview_images(output_dir)
 
     pdf_path = os.path.join(output_dir, "temp.pdf")
 
     try:
-        # 使用 vendored soffice.py
-        result = subprocess.run(
-            [
-                "python", str(OFFICE_ROOT / "soffice.py"),
-                "--headless", "--convert-to", "pdf", pptx_path,
-            ],
-            cwd=output_dir,
-            capture_output=True, text=True, timeout=120,
-        )
+        env = os.environ.copy()
+        if sys.platform != "darwin":
+            env["SAL_USE_VCLPLUGIN"] = "svp"
 
-        # soffice.py 会在 cwd 产出同名 pdf
         base = os.path.splitext(os.path.basename(pptx_path))[0]
         generated_pdf = os.path.join(output_dir, f"{base}.pdf")
-        if os.path.isfile(generated_pdf):
-            os.rename(generated_pdf, pdf_path)
+        last_failure = ""
+
+        for command in soffice_commands:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+
+            if result.returncode == 0 and os.path.isfile(generated_pdf):
+                if os.path.isfile(pdf_path):
+                    os.unlink(pdf_path)
+                os.rename(generated_pdf, pdf_path)
+                break
+
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            last_failure = stderr or stdout or f"exit {result.returncode}"
+            logger.warning(
+                "[PptxSkill] soffice 转 PDF 失败（命令: %s, exit %s）: %s",
+                os.path.basename(command[0]),
+                result.returncode,
+                last_failure[:300],
+            )
+        else:
+            logger.warning(f"[PptxSkill] soffice 转 PDF 最终失败: {last_failure[:300]}")
+            return []
     except Exception as e:
         logger.warning(f"[PptxSkill] PPTX→PDF 失败: {e}")
         return []
 
     if not os.path.isfile(pdf_path):
+        logger.warning("[PptxSkill] PDF 文件未生成")
         return []
 
     try:
         prefix = os.path.join(output_dir, "slide")
-        subprocess.run(
-            ["pdftoppm", "-jpeg", "-r", "150", pdf_path, prefix],
+        result = subprocess.run(
+            [pdftoppm_bin, "-jpeg", "-r", "150", pdf_path, prefix],
             capture_output=True, timeout=60,
         )
+        if result.returncode != 0:
+            logger.warning(f"[PptxSkill] pdftoppm 转图片失败 (exit {result.returncode})")
+            return []
     except Exception as e:
         logger.warning(f"[PptxSkill] PDF→图片 失败: {e}")
         return []
@@ -166,10 +396,6 @@ def pptx_to_images(pptx_path: str, output_dir: str = None) -> list[str]:
         if os.path.isfile(pdf_path):
             os.unlink(pdf_path)
 
-    images = sorted([
-        os.path.join(output_dir, f)
-        for f in os.listdir(output_dir)
-        if f.startswith("slide") and f.endswith(".jpg")
-    ])
+    images = _collect_slide_images(output_dir)
     print(f"[PptxSkill] 生成 {len(images)} 张预览图")
     return images

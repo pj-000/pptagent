@@ -12,13 +12,24 @@ logger = logging.getLogger(__name__)
 
 
 class ResearchAgent:
-    """用 Tavily 搜索每页主题，再用 GLM 提炼为 PPT 要点。"""
+    """用 Tavily 搜索每页主题，再用 LLM 提炼为 PPT 要点。"""
 
     SKIP_LAYOUTS = {SlideLayout.COVER, SlideLayout.CLOSING, SlideLayout.TOC}
 
     def __init__(self):
+        if not config.TAVILY_API_KEY or not config.TAVILY_API_KEY.strip():
+            self.tavily = None
+            self.llm = None
+            self.client = None
+            self._system_template = ""
+            print("[Research] TAVILY_API_KEY 未配置，Research 功能已禁用")
+            return
+
         self.tavily = AsyncTavilyClient(api_key=config.TAVILY_API_KEY)
-        self.llm = AsyncOpenAI(api_key=config.GLM_API_KEY, base_url=config.GLM_BASE_URL)
+        self.llm = AsyncOpenAI(
+            api_key=config.RESEARCH_API_KEY,
+            base_url=config.RESEARCH_BASE_URL,
+        )
         self.client = self.llm
         self._system_template = Path("prompts/researcher_system.txt").read_text(encoding="utf-8")
 
@@ -72,7 +83,7 @@ class ResearchAgent:
             snippets = [r.get("content", "") for r in search_result.get("results", [])]
             context = "\n\n".join(snippets[:3])
 
-            # Step 2: GLM 提炼为 PPT 要点
+            # Step 2: LLM 提炼为 PPT 要点
             system_prompt = self._system_template.replace("{language}", language)
             user_prompt = (
                 f"页面主题：{slide.topic}\n\n"
@@ -89,7 +100,11 @@ class ResearchAgent:
                 ],
             )
             raw = response.choices[0].message.content
-            print(f"[Research] 第 {slide.slide_index} 页 LLM 原始响应前200字：{repr(raw[:200])}")
+            # 调试：保存完整响应
+            if slide.slide_index in [3, 9]:  # 只保存失败的页面
+                debug_path = f"debug_research_page_{slide.slide_index}.txt"
+                Path(debug_path).write_text(raw, encoding="utf-8")
+                print(f"[Research] 第 {slide.slide_index} 页完整响应已保存到 {debug_path}")
             data = self._parse_json(raw)
 
             if "bullet_points" not in data or not isinstance(data["bullet_points"], list):
@@ -127,28 +142,84 @@ class ResearchAgent:
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = cleaned.strip()
 
+        # 智能替换 JSON 字符串值内的中文引号
+        def fix_quotes(text: str) -> str:
+            result = []
+            in_string = False
+            i = 0
+            while i < len(text):
+                ch = text[i]
+
+                # 处理转义
+                if ch == '\\' and i + 1 < len(text):
+                    result.append(ch)
+                    result.append(text[i + 1])
+                    i += 2
+                    continue
+
+                # 英文双引号：切换字符串状态
+                if ch == '"':
+                    in_string = not in_string
+                    result.append(ch)
+                # 在字符串内：替换中文引号和单引号
+                elif in_string:
+                    if ch in '""':
+                        result.append('\\"')
+                    elif ch in '\u2018\u2019':  # 中文单引号
+                        result.append("'")
+                    else:
+                        result.append(ch)
+                else:
+                    result.append(ch)
+
+                i += 1
+            return ''.join(result)
+
+        cleaned = fix_quotes(cleaned)
+
         # 尝试直接解析
         try:
-            result = json.loads(cleaned)
+            result = json.loads(cleaned, strict=False)
             if isinstance(result, dict):
                 return result
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            logger.debug(f"直接解析失败: {e}")
 
-        # fallback：提取第一个 {...} 块
-        match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned, re.DOTALL)
-        if match:
-            result = json.loads(match.group(0))
-            if isinstance(result, dict):
-                return result
-
-        # 最后尝试：找最外层的 { 到最后一个 }
+        # fallback：找最外层的 { 到匹配的 }
         first_brace = cleaned.find("{")
-        last_brace = cleaned.rfind("}")
-        if first_brace >= 0 and last_brace > first_brace:
-            candidate = cleaned[first_brace:last_brace + 1]
-            result = json.loads(candidate)
-            if isinstance(result, dict):
-                return result
+        if first_brace >= 0:
+            depth = 0
+            in_string = False
+            escape = False
+
+            for i in range(first_brace, len(cleaned)):
+                char = cleaned[i]
+
+                if escape:
+                    escape = False
+                    continue
+
+                if char == '\\':
+                    escape = True
+                    continue
+
+                if char == '"' and not escape:
+                    in_string = not in_string
+                    continue
+
+                if not in_string:
+                    if char == '{':
+                        depth += 1
+                    elif char == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidate = cleaned[first_brace:i + 1]
+                            try:
+                                result = json.loads(candidate, strict=False)
+                                if isinstance(result, dict):
+                                    return result
+                            except json.JSONDecodeError:
+                                pass
+                            break
 
         raise ValueError(f"无法从响应中提取 JSON dict，原始内容前200字：{cleaned[:200]}")

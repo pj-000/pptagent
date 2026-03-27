@@ -37,7 +37,7 @@ class OrchestratorAgent:
         language: str = "中文",
         min_slides: int = 6,
         max_slides: int = 10,
-        style: str = "auto",
+        style: str = "",
         audience: str = "general",
     ) -> str:
         print(f"\n{'='*50}")
