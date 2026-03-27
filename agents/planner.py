@@ -141,6 +141,25 @@ class PlannerAgent:
 
     def __init__(self):
         assert_skill_present()
+        env_key = os.getenv("PLANNER_API_KEY", "")
+        def mask_key(value: str) -> str:
+            if not value:
+                return "<empty>"
+            if len(value) > 16:
+                return f"{value[:12]}...{value[-6:]}"
+            return value
+        print(
+            "[Planner] LLM config: "
+            f"base_url={config.PLANNER_BASE_URL} | "
+            f"model={config.PLANNER_MODEL} | "
+            f"api_key={mask_key(config.PLANNER_API_KEY)}"
+        )
+        print(
+            "[Planner] Env check: "
+            f"os.getenv(PLANNER_API_KEY)={mask_key(env_key)} | "
+            f"config.PLANNER_API_KEY={mask_key(config.PLANNER_API_KEY)} | "
+            f"same={'yes' if env_key == config.PLANNER_API_KEY else 'no'}"
+        )
         self.client = OpenAI(
             api_key=config.PLANNER_API_KEY,
             base_url=config.PLANNER_BASE_URL,
@@ -738,12 +757,32 @@ class PlannerAgent:
         full_code = "\n".join(lines)
         full_code = self._sanitize_generated_code(full_code)
         full_code = self._enforce_theme_fonts(full_code, theme)
+        self._export_generated_js(slide_codes, full_code, output_path)
 
         total_chars = sum(len(c) for c in slide_codes)
         print(f"[Planner] 组装完成（{len(slide_codes)} 页，{total_chars} 字符），执行生成 PPTX...")
         run_js(full_code, output_path)
         print(f"[Planner] PPTX 生成成功: {output_path}")
         return output_path
+
+    @staticmethod
+    def _generated_js_dir(output_path: str) -> Path:
+        output_file = Path(output_path)
+        return output_file.parent / f"{output_file.stem}_generated_js"
+
+    def _export_generated_js(self, slide_codes: list[str], full_code: str, output_path: str) -> None:
+        export_dir = self._generated_js_dir(output_path)
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        for stale in export_dir.glob("slide_*.js"):
+            stale.unlink()
+
+        (export_dir / "presentation.js").write_text(full_code, encoding="utf-8")
+        for index, code in enumerate(slide_codes):
+            filename = export_dir / f"slide_{index:02d}.js"
+            filename.write_text(code.rstrip() + "\n", encoding="utf-8")
+
+        print(f"[Planner] 已导出每页 JS: {export_dir}")
 
     def _build_slide_system_prompt(self) -> str:
         """单页生成的 system prompt：设计规范 + API 教程，要求只输出片段。"""
@@ -1527,6 +1566,30 @@ class PlannerAgent:
 
         return code[j] in ",:;)}]+-*/%?&|<=>"
 
+    @staticmethod
+    def _looks_like_missing_js_comma_after_string(code: str, quote_index: int) -> bool:
+        j = quote_index + 1
+        saw_newline = False
+
+        while j < len(code) and code[j].isspace():
+            if code[j] in "\r\n":
+                saw_newline = True
+            j += 1
+
+        if not saw_newline or j >= len(code):
+            return False
+
+        if not (code[j].isalpha() or code[j] in "_$"):
+            return False
+
+        k = j + 1
+        while k < len(code) and (code[k].isalnum() or code[k] in "_$"):
+            k += 1
+        while k < len(code) and code[k].isspace():
+            k += 1
+
+        return k < len(code) and code[k] == ":"
+
     def _escape_problematic_js_string_quotes(self, code: str) -> str:
         """
         逐字符扫描 JS 代码，修复字符串字面量中的问题引号。
@@ -1623,6 +1686,11 @@ class PlannerAgent:
             if ch == quote_char:
                 if self._is_probable_js_string_end(code, i):
                     result.append(ch)
+                    state = "normal"
+                    quote_char = None
+                elif self._looks_like_missing_js_comma_after_string(code, i):
+                    result.append(ch)
+                    result.append(",")
                     state = "normal"
                     quote_char = None
                 else:
